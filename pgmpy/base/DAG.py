@@ -3,6 +3,7 @@ from __future__ import annotations
 import itertools
 from collections.abc import Hashable, Iterable, Sequence
 from os import PathLike
+from typing import TYPE_CHECKING
 
 import networkx as nx
 import numpy as np
@@ -14,6 +15,9 @@ from pgmpy.ci_tests import BaseCITest, get_ci_test
 from pgmpy.independencies import Independencies
 from pgmpy.utils._warnings import _warn_external
 from pgmpy.utils.parser import parse_dagitty, parse_lavaan
+
+if TYPE_CHECKING:
+    from pgmpy.base.ADMG import ADMG
 
 
 class DAG(_GraphRolesMixin, nx.DiGraph):
@@ -1227,6 +1231,106 @@ class DAG(_GraphRolesMixin, nx.DiGraph):
         OutEdgeView([('D', 'A'), ('D', 'B')])
         """
         return self.subgraph(nodes=self.get_ancestors(nodes=nodes))
+
+    def latent_projection(self, nodes: Iterable[Hashable]) -> ADMG:
+        """
+        Returns the latent projection of the DAG onto the given observed `nodes` as an ADMG.
+
+        The latent projection (Richardson, 2003) represents the conditional
+        independencies among the observed variables of a DAG with latent variables as an
+        Acyclic Directed Mixed Graph (ADMG) with directed (``"->"``) and bidirected
+        (``"<>"``) edges:
+
+        - A directed edge ``X -> Y`` is added if there is a directed path from ``X`` to
+          ``Y`` in the DAG on which every intermediate node is latent.
+        - A bidirected edge ``X <> Y`` is added if there is a trek ``X <- ... -> Y`` in
+          the DAG on which every intermediate node (including the trek's source) is
+          latent.
+
+        Both edge types can be present between the same pair of nodes. For any disjoint
+        ``X``, ``Y``, ``Z`` among the observed nodes, ``X`` and ``Y`` are d-separated
+        given ``Z`` in the DAG if and only if they are m-separated given ``Z`` in the
+        projection.
+
+        Parameters
+        ----------
+        nodes : iterable
+            The observed nodes to keep in the projection. All other nodes are treated
+            as latent and marginalized out.
+
+        Returns
+        -------
+        pgmpy.base.ADMG
+            The latent projection onto `nodes`. The retained nodes keep their identity,
+            node attributes, and roles; the input DAG is left unchanged, and the result
+            does not depend on the order of `nodes`.
+
+        Examples
+        --------
+        >>> from pgmpy.base import DAG
+        >>> dag = DAG([("H", "X"), ("H", "Y")], latents={"H"})
+        >>> sorted(dag.latent_projection(["X", "Y"]).get_edges(data=True))
+        [('X', 'Y', '<>')]
+        >>> dag = DAG([("X", "H"), ("H", "Y")], latents={"H"})
+        >>> sorted(dag.latent_projection(["X", "Y"]).get_edges(data=True))
+        [('X', 'Y', '->')]
+
+        References
+        ----------
+        - :footcite:t:`richardson_2003`
+        """
+        from pgmpy.base import ADMG
+
+        kept = set(nodes)
+        unknown = kept.difference(self.nodes)
+        if unknown:
+            raise ValueError(f"Nodes not present in the DAG: {unknown}")
+
+        # Kept nodes in the DAG's own node order, so the result is independent of the
+        # order in which `nodes` was passed.
+        node_order = [node for node in self.nodes if node in kept]
+
+        # For each node, the kept nodes reachable through directed paths whose
+        # intermediate nodes are all marginalized out.
+        reach = {}
+        for source in self.nodes:
+            reached = set()
+            visited = {source}
+            stack = [source]
+            while stack:
+                node = stack.pop()
+                for child in self.successors(node):
+                    if child in visited:
+                        continue
+                    visited.add(child)
+                    if child in kept:
+                        reached.add(child)
+                    else:
+                        stack.append(child)
+            reach[source] = reached
+
+        admg = ADMG()
+        for node in node_order:
+            attrs = dict(self.nodes[node])
+            if "roles" in attrs:
+                attrs["roles"] = set(attrs["roles"])
+            admg.add_node(node, **attrs)
+        admg.exposures = self.exposures.intersection(kept)
+        admg.outcomes = self.outcomes.intersection(kept)
+
+        for u in node_order:
+            for v in node_order:
+                if v in reach[u]:
+                    admg.add_edge(u, v, "->")
+
+        latents = [node for node in self.nodes if node not in kept]
+        for h in latents:
+            targets = [node for node in node_order if node in reach[h]]
+            for u, v in itertools.combinations(targets, 2):
+                if not admg.has_edge(u, v, "<>"):
+                    admg.add_edge(u, v, "<>")
+
+        return admg
 
     def to_daft(
         self,
