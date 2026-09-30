@@ -1,4 +1,5 @@
 from .base import Inference  # isort: skip  # noqa: E402
+from .ConditionalLinearGaussianInference import ConditionalLinearGaussianInference
 from .CausalInference import CausalInference
 from .ExactInference import BeliefPropagation, BeliefPropagationWithMessagePassing, VariableElimination
 from .ApproxInference import ApproxInference
@@ -8,6 +9,7 @@ from .mplp import Mplp
 __all__ = [
     "Inference",
     "VariableElimination",
+    "ConditionalLinearGaussianInference",
     "DBNInference",
     "BeliefPropagation",
     "BeliefPropagationWithMessagePassing",
