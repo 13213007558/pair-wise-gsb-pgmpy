@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import itertools
 from collections.abc import Hashable, Iterable, Sequence
 from os import PathLike
@@ -10,6 +11,7 @@ import pandas as pd
 
 from pgmpy import logger
 from pgmpy.base._mixin_roles import _GraphRolesMixin
+from pgmpy.base.ADMG import ADMG
 from pgmpy.ci_tests import BaseCITest, get_ci_test
 from pgmpy.independencies import Independencies
 from pgmpy.utils._warnings import _warn_external
@@ -1227,6 +1229,99 @@ class DAG(_GraphRolesMixin, nx.DiGraph):
         OutEdgeView([('D', 'A'), ('D', 'B')])
         """
         return self.subgraph(nodes=self.get_ancestors(nodes=nodes))
+
+    def latent_projection(self, nodes: Hashable | Iterable[Hashable]) -> ADMG:
+        """
+        Returns the latent projection of the DAG onto the given `nodes` as an ADMG.
+
+        The latent projection marginalizes out every variable not in `nodes` while
+        exactly preserving the conditional independence relations among the kept
+        variables: for any disjoint `X`, `Y`, `Z` in `nodes`, `X` and `Y` are
+        d-separated given `Z` in this DAG if and only if they are m-separated given
+        `Z` in the returned ADMG. The projection contains:
+
+        - A directed edge `X -> Y` iff there is a directed path from `X` to `Y` in
+          the DAG whose intermediate nodes are all marginalized out.
+        - A bidirected edge `X <> Y` iff `X` and `Y` have a common ancestor that is
+          marginalized out and reaches both through directed paths whose intermediate
+          nodes are all marginalized out.
+
+        Both kinds of edges can be present between the same pair of nodes.
+
+        Parameters
+        ----------
+        nodes: hashable or iterable of hashables
+            The variables to keep in the projection. Every other variable is
+            marginalized out, independently of whether it carries the `latents` role.
+
+        Returns
+        -------
+        pgmpy.base.ADMG
+            An ADMG over `nodes`. Node attributes (including roles) of the kept nodes
+            are copied over; this DAG is left unchanged. The result does not depend on
+            the order in which `nodes` are given.
+
+        Examples
+        --------
+        >>> from pgmpy.base import DAG
+        >>> dag = DAG([("X", "L"), ("L", "Y"), ("U", "X"), ("U", "Y")], latents={"L", "U"})
+        >>> admg = dag.latent_projection(["X", "Y"])
+        >>> sorted(admg.get_edges(data=True))
+        [('X', 'Y', '->'), ('X', 'Y', '<>')]
+
+        References
+        ----------
+        - :footcite:t:`richardson_2003` (Markov properties of ADMGs under latent projection).
+        """
+        if not isinstance(nodes, (list, tuple, set, frozenset)):
+            nodes = [nodes]
+
+        kept = set(nodes)
+        missing = kept - set(self.nodes())
+        if missing:
+            raise ValueError(f"Nodes not present in the graph: {missing}")
+
+        # Iterate in the DAG's node order so the result is independent of the order of `nodes`.
+        kept_ordered = [node for node in self.nodes if node in kept]
+        marginalized_ordered = [node for node in self.nodes if node not in kept]
+
+        def first_kept_reachable(source: Hashable) -> set[Hashable]:
+            # Kept nodes reachable from `source` through directed paths whose
+            # intermediate nodes are all marginalized out.
+            reached = set()
+            stack = [source]
+            visited = {source}
+            while stack:
+                node = stack.pop()
+                for child in self.successors(node):
+                    if child in visited:
+                        continue
+                    visited.add(child)
+                    if child in kept:
+                        reached.add(child)
+                    else:
+                        stack.append(child)
+            return reached
+
+        directed_edges = []
+        for x in kept_ordered:
+            reached = first_kept_reachable(x)
+            directed_edges.extend((x, y, "->") for y in kept_ordered if y in reached)
+
+        bidirected_pairs = set()
+        for latent in marginalized_ordered:
+            for x, y in itertools.combinations(first_kept_reachable(latent), 2):
+                bidirected_pairs.add(frozenset((x, y)))
+        bidirected_edges = [
+            (x, y, "<>")
+            for index, x in enumerate(kept_ordered)
+            for y in kept_ordered[index + 1 :]
+            if frozenset((x, y)) in bidirected_pairs
+        ]
+
+        admg = ADMG(edge_list=[*directed_edges, *bidirected_edges])
+        admg.add_nodes_from((node, copy.deepcopy(self.nodes[node])) for node in kept_ordered)
+        return admg
 
     def to_daft(
         self,

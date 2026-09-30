@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import itertools
 import os
 import unittest
 
@@ -1423,3 +1424,173 @@ TGFBR3.8 -> TGFBR3.9
         for parent, child in original_dag.edges():
             expected_edge_str = f"{parent} -> {child}"
             self.assertIn(expected_edge_str, dagitty_output, f"Missing edge: {expected_edge_str}")
+
+
+class TestDAGLatentProjection(unittest.TestCase):
+    def assert_ci_equivalent(self, dag, kept):
+        # The projection must preserve conditional independencies: for every pair of
+        # kept nodes and every conditioning set over the remaining kept nodes,
+        # d-separation in the DAG must match m-separation in the projected ADMG.
+        admg = dag.latent_projection(kept)
+        for x, y in itertools.permutations(kept, 2):
+            others = [node for node in kept if node not in (x, y)]
+            for size in range(len(others) + 1):
+                for z in itertools.combinations(others, size):
+                    dag_connected = dag.is_dconnected(x, y, observed=list(z))
+                    admg_connected = not admg.is_mseparated(x, y, conditioning_set=set(z))
+                    self.assertEqual(
+                        dag_connected,
+                        admg_connected,
+                        msg=f"CI mismatch for {x} and {y} given {z}",
+                    )
+        return admg
+
+    def test_latent_chain(self):
+        dag = DAG([("X", "L"), ("L", "Y")], latents={"L"})
+        admg = self.assert_ci_equivalent(dag, ["X", "Y"])
+        self.assertEqual(admg.get_edges(data=True), [("X", "Y", "->")])
+
+    def test_common_latent_cause(self):
+        dag = DAG([("L", "X"), ("L", "Y")], latents={"L"})
+        admg = self.assert_ci_equivalent(dag, ["X", "Y"])
+        self.assertEqual(admg.get_edges(data=True), [("X", "Y", "<>")])
+
+    def test_hidden_collider(self):
+        dag = DAG([("X", "L"), ("Y", "L"), ("X", "C")], latents={"L"})
+        admg = self.assert_ci_equivalent(dag, ["X", "Y", "C"])
+        self.assertEqual(admg.get_edges(data=True), [("X", "C", "->")])
+
+    def test_multilayer_hidden_path(self):
+        dag = DAG([("X", "L1"), ("L1", "L2"), ("L2", "Y")], latents={"L1", "L2"})
+        admg = self.assert_ci_equivalent(dag, ["X", "Y"])
+        self.assertEqual(admg.get_edges(data=True), [("X", "Y", "->")])
+
+    def test_observed_intermediate_blocks_projection(self):
+        dag = DAG(
+            [("X", "L1"), ("L1", "M"), ("M", "L2"), ("L2", "Y")],
+            latents={"L1", "L2"},
+        )
+        admg = self.assert_ci_equivalent(dag, ["X", "M", "Y"])
+        self.assertEqual(
+            sorted(admg.get_edges(data=True)),
+            [("M", "Y", "->"), ("X", "M", "->")],
+        )
+
+    def test_directed_and_bidirected_same_pair(self):
+        dag = DAG(
+            [("X", "L"), ("L", "Y"), ("U", "X"), ("U", "Y")],
+            latents={"L", "U"},
+        )
+        admg = self.assert_ci_equivalent(dag, ["X", "Y"])
+        self.assertEqual(
+            sorted(admg.get_edges(data=True)),
+            [("X", "Y", "->"), ("X", "Y", "<>")],
+        )
+
+    def test_mixed_graph(self):
+        dag = DAG(
+            [
+                ("I", "T"),
+                ("T", "M"),
+                ("M", "O"),
+                ("U", "T"),
+                ("U", "O"),
+                ("T", "L"),
+                ("L", "O"),
+            ],
+            latents={"U", "L"},
+        )
+        admg = self.assert_ci_equivalent(dag, ["I", "T", "M", "O"])
+        self.assertEqual(
+            sorted(admg.get_edges(data=True)),
+            [
+                ("I", "T", "->"),
+                ("M", "O", "->"),
+                ("T", "M", "->"),
+                ("T", "O", "->"),
+                ("T", "O", "<>"),
+            ],
+        )
+
+    def test_projection_independent_of_latents_role(self):
+        dag = DAG([("X", "L"), ("L", "Y")])
+        admg = self.assert_ci_equivalent(dag, ["X", "Y"])
+        self.assertEqual(admg.get_edges(data=True), [("X", "Y", "->")])
+
+    def test_keeps_node_attributes_and_roles(self):
+        dag = DAG(
+            [("X", "L"), ("L", "Y")],
+            latents={"L"},
+            roles={"exposures": "X", "outcomes": "Y"},
+        )
+        dag.nodes["X"]["custom"] = "value"
+
+        admg = dag.latent_projection(["X", "Y"])
+        self.assertEqual(set(admg.get_role("exposures")), {"X"})
+        self.assertEqual(set(admg.get_role("outcomes")), {"Y"})
+        self.assertEqual(admg.nodes["X"]["custom"], "value")
+        self.assertEqual(admg.latents, set())
+
+        # Mutating the projection must not leak into the original DAG.
+        admg.with_role(role="exposures", variables="Y", inplace=True)
+        admg.nodes["X"]["custom"] = "changed"
+        self.assertEqual(set(dag.get_role("exposures")), {"X"})
+        self.assertEqual(dag.nodes["X"]["custom"], "value")
+
+    def test_input_graph_unchanged(self):
+        dag = DAG(
+            [("X", "L"), ("L", "Y"), ("U", "X"), ("U", "Y")],
+            latents={"L", "U"},
+        )
+        nodes_before = dict(dag.nodes(data=True))
+        edges_before = set(dag.edges())
+
+        dag.latent_projection(["X", "Y"])
+
+        self.assertEqual(dict(dag.nodes(data=True)), nodes_before)
+        self.assertEqual(set(dag.edges()), edges_before)
+        self.assertEqual(dag.latents, {"L", "U"})
+
+    def test_node_order_does_not_matter(self):
+        dag = DAG(
+            [
+                ("I", "T"),
+                ("T", "M"),
+                ("M", "O"),
+                ("U", "T"),
+                ("U", "O"),
+                ("T", "L"),
+                ("L", "O"),
+            ],
+            latents={"U", "L"},
+        )
+        projections = [
+            dag.latent_projection(nodes)
+            for nodes in (
+                ["I", "T", "M", "O"],
+                ["O", "M", "T", "I"],
+                ("M", "I", "O", "T"),
+                {"I", "T", "M", "O"},
+            )
+        ]
+        reference = projections[0]
+        for projection in projections[1:]:
+            self.assertEqual(reference, projection)
+            self.assertEqual(reference.get_edges(data=True), projection.get_edges(data=True))
+            self.assertEqual(list(reference.nodes(data=True)), list(projection.nodes(data=True)))
+
+    def test_unknown_node_raises(self):
+        dag = DAG([("X", "Y")])
+        with self.assertRaises(ValueError):
+            dag.latent_projection(["X", "Z"])
+
+    def test_single_node_and_isolated_nodes(self):
+        dag = DAG([("X", "L"), ("L", "Y"), ("A", "B")], latents={"L"})
+
+        admg = dag.latent_projection("X")
+        self.assertEqual(set(admg.nodes()), {"X"})
+        self.assertEqual(admg.get_edges(data=True), [])
+
+        admg = dag.latent_projection(["X", "A"])
+        self.assertEqual(set(admg.nodes()), {"X", "A"})
+        self.assertEqual(admg.get_edges(data=True), [])
